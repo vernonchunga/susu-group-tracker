@@ -2,6 +2,9 @@ from decimal import Decimal
 
 from django.test import TestCase
 
+from rest_framework import status
+from rest_framework.test import APITestCase
+
 from .models import Contribution, Member, Payout, SusuGroup
 from .services import (
     DuplicateMemberError,
@@ -417,3 +420,264 @@ class SusuServiceTests(TestCase):
                 "AMA001",
                 Decimal("10.00"),
             )
+
+class SusuAPITests(APITestCase):
+    """
+    API-level tests for the Susu management system.
+    """
+
+    def setUp(self):
+        self.group_data = {
+            "name": "API Test Susu",
+            "weekly_contribution": "50.00",
+        }
+
+        response = self.client.post(
+            "/api/groups/",
+            self.group_data,
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_201_CREATED,
+        )
+
+        self.group_id = response.data["id"]
+
+        self.ama = self.add_member("AMA001", "Ama")
+        self.kofi = self.add_member("KOFI001", "Kofi")
+        self.esi = self.add_member("ESI001", "Esi")
+
+    def add_member(self, member_id, name):
+        response = self.client.post(
+            f"/api/groups/{self.group_id}/members/",
+            {
+                "member_id": member_id,
+                "name": name,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_201_CREATED,
+        )
+
+        return response.data
+
+    def pay(self, member_id, amount):
+        return self.client.post(
+            f"/api/groups/{self.group_id}/contributions/",
+            {
+                "member_id": member_id,
+                "amount": amount,
+            },
+            format="json",
+        )
+
+    def test_create_group_returns_created(self):
+        response = self.client.post(
+            "/api/groups/",
+            {
+                "name": "Another Susu",
+                "weekly_contribution": "75.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_201_CREATED,
+        )
+
+        self.assertEqual(
+            response.data["weekly_contribution"],
+            "75.00",
+        )
+
+    def test_duplicate_group_name_is_rejected(self):
+        response = self.client.post(
+            "/api/groups/",
+            self.group_data,
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_409_CONFLICT,
+        )
+
+    def test_list_members_returns_joining_order(self):
+        response = self.client.get(
+            f"/api/groups/{self.group_id}/members/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertEqual(
+            [member["member_id"] for member in response.data],
+            ["AMA001", "KOFI001", "ESI001"],
+        )
+
+    def test_unknown_member_contribution_returns_404(self):
+        response = self.pay("UNKNOWN", "50.00")
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_overpayment_returns_400(self):
+        response = self.pay("AMA001", "60.00")
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    def test_week_cannot_close_with_outstanding_contribution(self):
+        self.pay("AMA001", "50.00")
+        self.pay("KOFI001", "50.00")
+        self.pay("ESI001", "30.00")
+
+        response = self.client.post(
+            f"/api/groups/{self.group_id}/close-week/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_409_CONFLICT,
+        )
+
+        self.assertEqual(
+            response.data["outstanding"]["ESI001"]["owes"],
+            Decimal("20.00"),
+        )
+
+        self.assertEqual(Payout.objects.count(), 0)
+
+        self.assertEqual(
+            SusuGroup.objects.get(pk=self.group_id).current_week,
+            1,
+        )
+
+    def test_successful_week_closure_returns_correct_payout(self):
+        for member_id in ["AMA001", "KOFI001", "ESI001"]:
+            response = self.pay(member_id, "50.00")
+
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_201_CREATED,
+            )
+
+        response = self.client.post(
+            f"/api/groups/{self.group_id}/close-week/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertEqual(response.data["recipient"], "Ama")
+        self.assertEqual(response.data["member_id"], "AMA001")
+        self.assertEqual(response.data["week"], 1)
+        self.assertEqual(response.data["amount"], "150.00")
+
+        self.assertEqual(
+            SusuGroup.objects.get(pk=self.group_id).current_week,
+            2,
+        )
+
+    def test_report_contains_payment_status_and_payout_history(self):
+        self.pay("AMA001", "50.00")
+        self.pay("KOFI001", "50.00")
+        self.pay("ESI001", "50.00")
+
+        self.client.post(
+            f"/api/groups/{self.group_id}/close-week/",
+            {},
+            format="json",
+        )
+
+        response = self.client.get(
+            f"/api/groups/{self.group_id}/report/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertEqual(response.data["current_week"], 2)
+        self.assertEqual(len(response.data["payout_history"]), 1)
+
+        ama_status = next(
+            member
+            for member in response.data["members"]
+            if member["member_id"] == "AMA001"
+        )
+
+        self.assertEqual(ama_status["owed"], Decimal("50.00"))
+        self.assertFalse(ama_status["paid_in_full"])
+
+    def test_unknown_group_returns_404(self):
+        response = self.client.get("/api/groups/999999/")
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_partial_payment_workflow_through_api(self):
+        self.pay("AMA001", "50.00")
+        self.pay("KOFI001", "50.00")
+
+        first_payment = self.pay("ESI001", "30.00")
+        second_payment = self.pay("ESI001", "20.00")
+
+        self.assertEqual(
+            first_payment.status_code,
+            status.HTTP_201_CREATED,
+        )
+
+        self.assertEqual(
+            second_payment.status_code,
+            status.HTTP_201_CREATED,
+        )
+
+        response = self.client.post(
+            f"/api/groups/{self.group_id}/close-week/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertEqual(response.data["recipient"], "Ama")
+        self.assertEqual(response.data["amount"], "150.00")
+
+        esi = Member.objects.get(
+            group_id=self.group_id,
+            member_id="ESI001",
+        )
+
+        self.assertEqual(
+            Contribution.objects.filter(
+                group_id=self.group_id,
+                member=esi,
+                week=1,
+            ).count(),
+            2,
+        )
