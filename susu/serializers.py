@@ -1,10 +1,21 @@
 from decimal import Decimal
 from rest_framework import serializers
+from rest_framework.validators import UniqueValidator
 
 from .models import Member, SusuGroup
 
 
 class SusuGroupSerializer(serializers.ModelSerializer):
+    name = serializers.CharField(
+        max_length=100,
+        validators=[
+            UniqueValidator(
+                queryset=SusuGroup.objects.all(),
+                message="A group with this name already exists.",
+            )
+        ],
+    )
+
     class Meta:
         model = SusuGroup
         fields = [

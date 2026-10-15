@@ -103,7 +103,20 @@ class GroupListCreateView(APIView):
 
     def post(self, request):
         serializer = SusuGroupSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+
+        if not serializer.is_valid():
+            errors = serializer.errors
+
+            if "name" in errors:
+                return Response(
+                    {"error": errors["name"][0]},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            return Response(
+                errors,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             group = create_group(
